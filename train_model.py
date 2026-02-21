@@ -32,7 +32,8 @@ from transformers import (
     DataCollatorWithPadding,
     TrainingArguments,
     Trainer,
-    set_seed
+    set_seed,
+    EarlyStoppingCallback
 )
 
 from huggingface_hub import login
@@ -75,7 +76,7 @@ feature_extractor = AutoFeatureExtractor.from_pretrained(
 dataset = load_dataset("badrex/nnti-dataset-full")
 
 # %%
-# check the strucutre of the dataset object 
+# check the strucutre of the dataset object
 print(f"dataset['train']: {dataset['train']}")
 
 # %%
@@ -91,7 +92,6 @@ valid_ds = dataset['validation'].shuffle(seed=42)
 train_ds = train_ds.cast_column("audio_filepath", Audio(sampling_rate=16000))
 valid_ds = valid_ds.cast_column("audio_filepath", Audio(sampling_rate=16000))
 
-
 # %%
 # based on the model typel, set input features key
 if model_id == "facebook/w2v-bert-2.0":
@@ -104,9 +104,9 @@ max_duration = 7 # in seconds
 
 # %%
 # get the set of languages
-LABELS = train_ds.unique('language')
+LABELS = sorted(train_ds.unique('language'))
 
-sorted_labels = sorted(l.upper() for l in LABELS) 
+sorted_labels = sorted(l.upper() for l in LABELS)
 print(f"Languages: {sorted_labels}")
 
 str_to_int = {
@@ -116,7 +116,6 @@ str_to_int = {
 
 # %%
 def preprocess_function(examples):
-
     audio_arrays = [x["array"] for x in examples["audio_filepath"]]
 
     inputs = feature_extractor(
@@ -142,7 +141,7 @@ def preprocess_function(examples):
 keep_cols = ['speaker_id', 'language']
 
 # %% [markdown]
-# ## encode the train and valid splits 
+# ## encode the train and valid splits
 
 # %%
 train_ds_encoded = train_ds.map(
@@ -176,7 +175,7 @@ config.num_labels=num_labels
 config.label2id=str_to_int
 config.id2label=int_to_str
 
-do_apply_dropout = False 
+do_apply_dropout = True
 
 # check if dropout is enabled
 if do_apply_dropout:
@@ -226,68 +225,166 @@ data_collator = AudioDataCollator(feature_extractor)
 
 # %%
 batch_size = 8
-gradient_accumulation_steps = 2
-num_train_epochs = 3
-lr = 0.00001
+gradient_accumulation_steps = 4
+num_train_epochs_stage1 = 2
+num_train_epochs_stage2 = 20
+lr_stage1 = 0.0002
+lr_stage2 = 0.00001
 
 # %%
-wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
+wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr_stage2}_{current_time_str}")
 
-# %%
-training_args = TrainingArguments(
-    group_by_length=False,
-    #run_name='SLID_1', 
-    report_to="wandb",  # enable logging to W&B
-    logging_steps=1,  # how often to log to W&B
-    per_device_train_batch_size=batch_size, 
-    per_device_eval_batch_size=batch_size,    
-    eval_strategy="steps",
-    eval_steps=100,
-    save_strategy="steps", 
-    save_steps=100,
-    learning_rate=lr,
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    num_train_epochs=num_train_epochs,
-    weight_decay=0.01,
-    warmup_ratio=0.1,
-    load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    greater_is_better=True,  # True if your metric should be maximized (like accuracy)
-    save_total_limit=2,  # Keep only the best model
-    fp16=True,
-    push_to_hub=False,
-)
+if wandb.config is not None:
+    if "batch_size" in wandb.config: batch_size = int(wandb.config["batch_size"])
+    if "gradient_accumulation_steps" in wandb.config: gradient_accumulation_steps = int(
+        wandb.config["gradient_accumulation_steps"])
+    if "num_train_epochs_stage1" in wandb.config: num_train_epochs_stage1 = int(wandb.config["num_train_epochs_stage1"])
+    if "num_train_epochs_stage2" in wandb.config: num_train_epochs_stage2 = int(wandb.config["num_train_epochs_stage2"])
+    if "lr_stage1" in wandb.config: lr_stage1 = float(wandb.config["lr_stage1"])
+    if "lr_stage2" in wandb.config: lr_stage2 = float(wandb.config["lr_stage2"])
+    if "max_duration" in wandb.config: max_duration = int(wandb.config["max_duration"])
+    if "warmup_ratio" in wandb.config: pass
+    if "weight_decay" in wandb.config: pass
 
 # %%
 # load evaluation metrics
 accuracy_metric = evaluate.load("accuracy")
+f1_metric = evaluate.load("f1")
+
 
 def compute_metrics(eval_pred):
     """Computes accuracy on a batch of predictions"""
     predictions = np.argmax(eval_pred.predictions, axis=1)
-    return accuracy_metric.compute(
-        predictions=predictions, 
+    out = accuracy_metric.compute(
+        predictions=predictions,
         references=eval_pred.label_ids
     )
+    out.update(
+        f1_metric.compute(
+            predictions=predictions,
+            references=eval_pred.label_ids,
+            average="macro"
+        )
+    )
+    return out
 
+
+# %%
+def _get_encoder(m):
+    for a in ("wav2vec2", "hubert", "w2v2_bert", "encoder", "model"):
+        if hasattr(m, a):
+            return getattr(m, a)
+    return None
+
+
+def freeze_encoder(m):
+    enc = _get_encoder(m)
+    if enc is None:
+        return
+    for p in enc.parameters():
+        p.requires_grad = False
+
+
+def unfreeze_encoder(m):
+    enc = _get_encoder(m)
+    if enc is None:
+        return
+    for p in enc.parameters():
+        p.requires_grad = True
+
+
+# %%
+freeze_encoder(slid_model)
+
+# %%
+training_args_stage1 = TrainingArguments(
+    group_by_length=False,
+    report_to="wandb",
+    logging_steps=25,
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size,
+    eval_strategy="steps",
+    eval_steps=500,
+    save_strategy="steps",
+    save_steps=500,
+    learning_rate=lr_stage1,
+    lr_scheduler_type="cosine",
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    num_train_epochs=num_train_epochs_stage1,
+    weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
+    warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    greater_is_better=True,
+    save_total_limit=2,
+    fp16=True,
+    max_grad_norm=1.0,
+    push_to_hub=False,
+)
+
+# %%
+trainer_stage1 = Trainer(
+    slid_model,
+    training_args_stage1,
+    train_dataset=train_ds_encoded,
+    eval_dataset=valid_ds_encoded,
+    tokenizer=feature_extractor,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+)
+
+# %%
+print("Train loop starting (stage 1: head-only)")
+trainer_stage1.train()
+
+# %%
+unfreeze_encoder(slid_model)
+
+# %%
+training_args_stage2 = TrainingArguments(
+    group_by_length=False,
+    report_to="wandb",
+    logging_steps=25,
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size,
+    eval_strategy="steps",
+    eval_steps=500,
+    save_strategy="steps",
+    save_steps=500,
+    learning_rate=lr_stage2,
+    lr_scheduler_type="cosine",
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    num_train_epochs=num_train_epochs_stage2,
+    weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
+    warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    greater_is_better=True,
+    save_total_limit=2,
+    fp16=True,
+    max_grad_norm=1.0,
+    push_to_hub=False,
+)
 
 # %%
 trainer = Trainer(
     slid_model,
-    training_args,
+    training_args_stage2,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
-    processing_class=feature_extractor,
-    data_collator=data_collator,  
+    tokenizer=feature_extractor,
+    data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
 )
 
 # %%
-print("Train loop starting...")
+print("Train loop starting (stage 2: full finetune)")
 trainer.train()
 
 # %%
-# push model to hub 
+# push model to hub
 # slid_model.push_to_hub(
 #     "your-hf-account/indic-language-identification"
 # )
@@ -296,7 +393,6 @@ trainer.train()
 print("Final evaluation starting...")
 trainer.evaluate()
 
-
-# save model to disk 
+# save model to disk
 save_dir = "./indic-SLID/inprogress"
 slid_model.save_pretrained(save_dir)
