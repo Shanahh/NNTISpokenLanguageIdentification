@@ -1,6 +1,5 @@
-# baseline_repro_task1.py
-import os
 # %%
+import os
 from datetime import datetime
 
 current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -19,9 +18,9 @@ import wandb
 from datasets import (
     load_dataset,
     Audio
-    # load_from_disk,
-    # DatasetDict,
-    # concatenate_datasets,
+    # load_from_disk, 
+    # DatasetDict, 
+    # concatenate_datasets, 
 )
 
 # %%
@@ -46,9 +45,7 @@ import evaluate
 # check if there GPU
 print("Check if GPU available:")
 print(f"torch.cuda.is_available(): {torch.cuda.is_available()}")
-print(f"torch.cuda.get_device_name(): {torch.cuda.get_device_name() if torch.cuda.is_available() else 'CPU'}")
-
-set_seed(42)
+print(f"torch.cuda.get_device_name(): {torch.cuda.get_device_name()}")
 
 # %%
 # login to Hugging Face
@@ -79,7 +76,7 @@ feature_extractor = AutoFeatureExtractor.from_pretrained(
 dataset = load_dataset("badrex/nnti-dataset-full")
 
 # %%
-# check the strucutre of the dataset object
+# check the strucutre of the dataset object 
 print(f"dataset['train']: {dataset['train']}")
 
 # %%
@@ -107,7 +104,7 @@ max_duration = 7  # in seconds
 
 # %%
 # get the set of languages
-LABELS = sorted(train_ds.unique('language'))
+LABELS = train_ds.unique('language')
 
 sorted_labels = sorted(l.upper() for l in LABELS)
 print(f"Languages: {sorted_labels}")
@@ -145,7 +142,7 @@ def preprocess_function(examples):
 keep_cols = ['speaker_id', 'language']
 
 # %% [markdown]
-# ## encode the train and valid splits
+# ## encode the train and valid splits 
 
 # %%
 train_ds_encoded = train_ds.map(
@@ -183,9 +180,9 @@ do_apply_dropout = False
 
 # check if dropout is enabled
 if do_apply_dropout:
-    config.hidden_dropout = 0.1
-    config.attention_dropout = 0.1
-    config.activation_dropout = 0.1
+    config.hidden_dropout = 0.1  # Dropout for hidden states
+    config.attention_dropout = 0.1  # Dropout in attention layers
+    config.activation_dropout = 0.1  # Dropout after activation functions
     config.feat_proj_dropout = 0.1
 
 # %%
@@ -239,14 +236,16 @@ wandb.init(project="Indic-SLID", name=f"TASK1_BASELINE_{model_id}_{lr}_{current_
 
 # %%
 training_args = TrainingArguments(
-    output_dir=f"./outputs/task1_baseline_{current_time_str}",
     group_by_length=False,
-    report_to="wandb",
-    logging_steps=25,
+    # run_name='SLID_1',
+    report_to="wandb",  # enable logging to W&B
+    logging_steps=1,  # how often to log to W&B
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
     learning_rate=lr,
     gradient_accumulation_steps=gradient_accumulation_steps,
     num_train_epochs=num_train_epochs,
@@ -254,9 +253,9 @@ training_args = TrainingArguments(
     warmup_ratio=0.1,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
-    greater_is_better=True,
-    save_total_limit=2,
-    fp16=torch.cuda.is_available(),
+    greater_is_better=True,  # True if your metric should be maximized (like accuracy)
+    save_total_limit=2,  # Keep only the best model
+    fp16=True,
     push_to_hub=False,
 )
 
@@ -276,11 +275,11 @@ def compute_metrics(eval_pred):
 
 # %%
 trainer = Trainer(
-    model=slid_model,
-    args=training_args,
+    slid_model,
+    training_args,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
-    tokenizer=feature_extractor,
+    processing_class=feature_extractor,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
 )
@@ -290,17 +289,15 @@ print("Train loop starting...")
 trainer.train()
 
 # %%
-# push model to hub
+# push model to hub 
 # slid_model.push_to_hub(
 #     "your-hf-account/indic-language-identification"
 # )
 
 # %%
 print("Final evaluation starting...")
-metrics = trainer.evaluate()
-print(metrics)
+trainer.evaluate()
 
 # save model to disk
-save_dir = "./indic-SLID/task1-baseline"
-trainer.save_model(save_dir)
-feature_extractor.save_pretrained(save_dir)
+save_dir = "./indic-SLID/inprogress"
+slid_model.save_pretrained(save_dir)
