@@ -1,6 +1,7 @@
 import os
 # %%
 from datetime import datetime
+
 current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 print(f"Current time: {current_time_str}")
@@ -14,12 +15,17 @@ import numpy as np
 import torch
 import wandb
 
+import random
+import torchaudio
+import torchaudio.functional as AF
+import torchaudio.transforms as AT
+
 from datasets import (
     load_dataset, 
     Audio
-    # load_from_disk, 
-    # DatasetDict, 
-    # concatenate_datasets, 
+    # load_from_disk,
+    # DatasetDict,
+    # concatenate_datasets,
 )
 
 # %%
@@ -103,6 +109,103 @@ else:
 max_duration = 7 # in seconds
 
 # %%
+# Augmentation toggles (enable/disable as needed)
+ENABLE_AUGMENTATION = False
+AUGMENT_PROB = 0.8  # probability to apply augmentation per sample
+SR_AUG = 16000
+
+AUG_PITCH_MIN = -2.0  # semitones
+AUG_PITCH_MAX = 2.0
+AUG_SPEED_MIN = 0.9  # speed perturb rate
+AUG_SPEED_MAX = 1.1
+AUG_SHIFT_MS = 50  # max time shift (ms)
+AUG_SNR_MIN = 10.0  # dB
+AUG_SNR_MAX = 25.0
+
+ENABLE_SPEC_AUGMENT = False
+SPEC_TIME_MASK_PARAM = 30
+SPEC_NUM_TIME_MASKS = 2
+
+
+def _clamp_audio(x, peak=0.99):
+    m = x.abs().max().clamp(min=1e-6)
+    return (x / m) * peak if m > peak else x
+
+
+def random_time_shift(x, max_shift_ms=AUG_SHIFT_MS, sr=SR_AUG):
+    max_shift = int(sr * max_shift_ms / 1000)
+    if max_shift <= 0:
+        return x
+    shift = random.randint(-max_shift, max_shift)
+    return torch.roll(x, shifts=shift)
+
+
+def random_gain(x, min_db=-6.0, max_db=6.0):
+    db = random.uniform(min_db, max_db)
+    g = 10 ** (db / 20)
+    return _clamp_audio(x * g)
+
+
+def add_noise(x, snr_db_min=AUG_SNR_MIN, snr_db_max=AUG_SNR_MAX):
+    snr_db = random.uniform(snr_db_min, snr_db_max)
+    sig_power = x.pow(2).mean().clamp(min=1e-9)
+    noise = torch.randn_like(x)
+    noise_power = noise.pow(2).mean().clamp(min=1e-9)
+    k = torch.sqrt(sig_power / (10 ** (snr_db / 10) * noise_power))
+    y = x + k * noise
+    return _clamp_audio(y)
+
+
+def speed_perturb_resample(x, sr=SR_AUG, min_rate=AUG_SPEED_MIN, max_rate=AUG_SPEED_MAX):
+    rate = random.uniform(min_rate, max_rate)
+    if abs(rate - 1.0) < 1e-3:
+        return x
+    src_sr = int(sr * rate)
+    y = AT.Resample(orig_freq=sr, new_freq=src_sr)(x.unsqueeze(0)).squeeze(0)
+    y = AT.Resample(orig_freq=src_sr, new_freq=sr)(y.unsqueeze(0)).squeeze(0)
+    return y
+
+
+def pitch_shift(x, sr=SR_AUG, min_semitones=AUG_PITCH_MIN, max_semitones=AUG_PITCH_MAX):
+    n_steps = random.uniform(min_semitones, max_semitones)
+    if abs(n_steps) < 1e-3:
+        return x
+    y = AF.pitch_shift(x.unsqueeze(0), sample_rate=sr, n_steps=n_steps).squeeze(0)
+    return _clamp_audio(y)
+
+
+def apply_random_augmentation(x):
+    if (not ENABLE_AUGMENTATION) or (random.random() > AUGMENT_PROB):
+        return x
+    if random.random() < 0.5:
+        x = random_gain(x)
+    if random.random() < 0.7:
+        x = random_time_shift(x)
+    if random.random() < 0.7:
+        x = speed_perturb_resample(x)
+    if random.random() < 0.5:
+        x = pitch_shift(x)
+    if random.random() < 0.5:
+        x = add_noise(x)
+    return x
+
+
+def _maybe_spec_augment_input_values(x, attention_mask=None):
+    if not ENABLE_SPEC_AUGMENT:
+        return x
+    if x.dim() != 2:
+        return x
+    tm = AT.TimeMasking(time_mask_param=SPEC_TIME_MASK_PARAM)
+    y = x.unsqueeze(1)  # [B, 1, T]
+    for _ in range(SPEC_NUM_TIME_MASKS):
+        y = tm(y)
+    y = y.squeeze(1)
+    if attention_mask is not None:
+        y = y * attention_mask.to(y.dtype)
+    return y
+
+
+# %%
 # get the set of languages
 LABELS = sorted(train_ds.unique('language'))
 
@@ -138,7 +241,7 @@ def preprocess_function(examples):
     return inputs
 
 # %%
-keep_cols = ['speaker_id', 'language']
+keep_cols = ['speaker_id', 'language', 'audio_filepath']
 
 # %% [markdown]
 # ## encode the train and valid splits
@@ -196,27 +299,60 @@ slid_model = AutoModelForAudioClassification.from_pretrained(
 class AudioDataCollator:
     def __init__(self, feature_extractor):
         self.feature_extractor = feature_extractor
-    
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # prepare the batch dict in the format expected by the feature extractor
-        batch = {
-            input_features_key: [f[input_features_key] for f in features],
-            "attention_mask": [f["attention_mask"] for f in features]
-        }
-        
+        # Use raw audio for on-the-fly augmentation + extraction if available
+        use_raw_audio = (
+                "audio_filepath" in features[0]
+                and isinstance(features[0]["audio_filepath"], dict)
+                and "array" in features[0]["audio_filepath"]
+        )
+
+        if use_raw_audio:
+            audio_arrays = [f["audio_filepath"]["array"] for f in features]
+            audio_tensors = [torch.tensor(a, dtype=torch.float32) for a in audio_arrays]
+
+            audio_tensors = [apply_random_augmentation(x) for x in audio_tensors]
+            audio_arrays = [x.numpy() for x in audio_tensors]
+
+            inputs = self.feature_extractor(
+                audio_arrays,
+                sampling_rate=self.feature_extractor.sampling_rate,
+                truncation=True,
+                max_length=int(self.feature_extractor.sampling_rate * max_duration),
+                return_attention_mask=True,
+            )
+
+            batch = {
+                input_features_key: inputs[input_features_key],
+                "attention_mask": inputs["attention_mask"]
+            }
+        else:
+            batch = {
+                input_features_key: [f[input_features_key] for f in features],
+                "attention_mask": [f["attention_mask"] for f in features]
+            }
+
         # use the feature extractor's native padding
         batch = self.feature_extractor.pad(
             batch,
             padding=True,
             return_tensors="pt"
         )
-        
+
+        if input_features_key in batch:
+            batch[input_features_key] = _maybe_spec_augment_input_values(
+                batch[input_features_key],
+                attention_mask=batch.get("attention_mask", None)
+            )
+
         # add labels
         batch["labels"] = torch.tensor(
-            [f["label"] for f in features], 
+            [f["label"] for f in features],
             dtype=torch.long
         )
-        
+
         return batch
 
 
