@@ -362,22 +362,18 @@ data_collator = AudioDataCollator(feature_extractor)
 # %%
 batch_size = 8
 gradient_accumulation_steps = 4
-num_train_epochs_stage1 = 2
-num_train_epochs_stage2 = 20
-lr_stage1 = 0.0002
-lr_stage2 = 0.00001
+num_train_epochs = 20
+lr = 0.00001
 
 # %%
-wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr_stage2}_{current_time_str}")
+wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
 
 if wandb.config is not None:
     if "batch_size" in wandb.config: batch_size = int(wandb.config["batch_size"])
     if "gradient_accumulation_steps" in wandb.config: gradient_accumulation_steps = int(
         wandb.config["gradient_accumulation_steps"])
-    if "num_train_epochs_stage1" in wandb.config: num_train_epochs_stage1 = int(wandb.config["num_train_epochs_stage1"])
-    if "num_train_epochs_stage2" in wandb.config: num_train_epochs_stage2 = int(wandb.config["num_train_epochs_stage2"])
-    if "lr_stage1" in wandb.config: lr_stage1 = float(wandb.config["lr_stage1"])
-    if "lr_stage2" in wandb.config: lr_stage2 = float(wandb.config["lr_stage2"])
+    if "num_train_epochs" in wandb.config: num_train_epochs = int(wandb.config["num_train_epochs"])
+    if "lr" in wandb.config: lr = float(wandb.config["lr"])
     if "max_duration" in wandb.config: max_duration = int(wandb.config["max_duration"])
     if "warmup_ratio" in wandb.config: pass
     if "weight_decay" in wandb.config: pass
@@ -406,34 +402,7 @@ def compute_metrics(eval_pred):
 
 
 # %%
-def _get_encoder(m):
-    for a in ("wav2vec2", "hubert", "w2v2_bert", "encoder", "model"):
-        if hasattr(m, a):
-            return getattr(m, a)
-    return None
-
-
-def freeze_encoder(m):
-    enc = _get_encoder(m)
-    if enc is None:
-        return
-    for p in enc.parameters():
-        p.requires_grad = False
-
-
-def unfreeze_encoder(m):
-    enc = _get_encoder(m)
-    if enc is None:
-        return
-    for p in enc.parameters():
-        p.requires_grad = True
-
-
-# %%
-freeze_encoder(slid_model)
-
-# %%
-training_args_stage1 = TrainingArguments(
+training_args = TrainingArguments(
     group_by_length=False,
     report_to="wandb",
     logging_steps=25,
@@ -443,59 +412,14 @@ training_args_stage1 = TrainingArguments(
     eval_steps=500,
     save_strategy="steps",
     save_steps=500,
-    learning_rate=lr_stage1,
+    learning_rate=lr,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
-    num_train_epochs=num_train_epochs_stage1,
+    num_train_epochs=num_train_epochs,
     weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
     warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
     load_best_model_at_end=True,
-    metric_for_best_model="f1",
-    greater_is_better=True,
-    save_total_limit=2,
-    fp16=True,
-    max_grad_norm=1.0,
-    push_to_hub=False,
-)
-
-# %%
-trainer_stage1 = Trainer(
-    slid_model,
-    training_args_stage1,
-    train_dataset=train_ds_encoded,
-    eval_dataset=valid_ds_encoded,
-    tokenizer=feature_extractor,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
-)
-
-# %%
-print("Train loop starting (stage 1: head-only)")
-trainer_stage1.train()
-
-# %%
-unfreeze_encoder(slid_model)
-
-# %%
-training_args_stage2 = TrainingArguments(
-    group_by_length=False,
-    report_to="wandb",
-    logging_steps=25,
-    per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=batch_size,
-    eval_strategy="steps",
-    eval_steps=500,
-    save_strategy="steps",
-    save_steps=500,
-    learning_rate=lr_stage2,
-    lr_scheduler_type="cosine",
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    num_train_epochs=num_train_epochs_stage2,
-    weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
-    warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
-    load_best_model_at_end=True,
-    metric_for_best_model="f1",
+    metric_for_best_model="accuracy",
     greater_is_better=True,
     save_total_limit=2,
     fp16=True,
@@ -506,7 +430,7 @@ training_args_stage2 = TrainingArguments(
 # %%
 trainer = Trainer(
     slid_model,
-    training_args_stage2,
+    training_args,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
     tokenizer=feature_extractor,
@@ -516,14 +440,8 @@ trainer = Trainer(
 )
 
 # %%
-print("Train loop starting (stage 2: full finetune)")
+print("Train loop starting...")
 trainer.train()
-
-# %%
-# push model to hub
-# slid_model.push_to_hub(
-#     "your-hf-account/indic-language-identification"
-# )
 
 # %%
 print("Final evaluation starting...")
