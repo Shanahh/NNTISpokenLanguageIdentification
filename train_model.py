@@ -278,7 +278,7 @@ config.num_labels=num_labels
 config.label2id=str_to_int
 config.id2label=int_to_str
 
-do_apply_dropout = True
+do_apply_dropout = False
 
 # check if dropout is enabled
 if do_apply_dropout:
@@ -293,6 +293,7 @@ slid_model = AutoModelForAudioClassification.from_pretrained(
     model_id,
     config=config,
 )
+
 
 # %%
 # create collator for padding
@@ -361,9 +362,9 @@ data_collator = AudioDataCollator(feature_extractor)
 
 # %%
 batch_size = 8
-gradient_accumulation_steps = 4
+gradient_accumulation_steps = 2
 num_train_epochs = 20
-lr = 0.00001
+lr = 0.00002
 
 # %%
 wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
@@ -408,10 +409,8 @@ training_args = TrainingArguments(
     logging_steps=25,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    eval_strategy="steps",
-    eval_steps=500,
-    save_strategy="steps",
-    save_steps=500,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
     learning_rate=lr,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -422,7 +421,7 @@ training_args = TrainingArguments(
     metric_for_best_model="accuracy",
     greater_is_better=True,
     save_total_limit=2,
-    fp16=True,
+    fp16=torch.cuda.is_available(),
     max_grad_norm=1.0,
     push_to_hub=False,
 )
@@ -436,7 +435,7 @@ trainer = Trainer(
     tokenizer=feature_extractor,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+    # callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
 )
 
 # %%
