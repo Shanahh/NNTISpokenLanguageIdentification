@@ -1,6 +1,7 @@
-import os
 # %%
+import os
 from datetime import datetime
+
 current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 print(f"Current time: {current_time_str}")
@@ -57,17 +58,14 @@ print(f"torch.cuda.get_device_name(): {torch.cuda.get_device_name()}")
 # %%
 # login to Hugging Face
 hf_key = os.environ.get("HF_KEY")
-os.environ['HF_HOME'] = '/tmp/.cache'
-login(token=hf_key, add_to_git_credential=False)
+if hf_key:
+    login(token=hf_key)
 
 # %%
 # login to WANDB
-# os.environ['WANDB_CONFIG_DIR'] = '/tmp/.config'
-# os.environ["WANDB_CACHE_DIR"] = os.getcwd()
-# wandb_key = os.environ.get("WANDB_KEY")
-# wandb.login(key=wandb_key, relogin=True, host="https://api.wandb.ai")
-wandb.init(project="indic_slid")
-os.environ['NUMBA_CACHE_DIR'] = '/tmp/numba_cache'
+wandb_key = os.environ.get("WANDB_KEY")
+if wandb_key:
+    wandb.login(key=wandb_key)
 
 # %%
 model_id = "facebook/mms-300m"
@@ -101,9 +99,6 @@ valid_ds = dataset['validation'].shuffle(seed=42)
 # resample to 16kHz
 train_ds = train_ds.cast_column("audio_filepath", Audio(sampling_rate=16000))
 valid_ds = valid_ds.cast_column("audio_filepath", Audio(sampling_rate=16000))
-
-# train_ds = train_ds.select(range(300))
-# valid_ds = valid_ds.select(range(80))
 
 # %%
 # based on the model typel, set input features key
@@ -161,7 +156,7 @@ train_ds_encoded = train_ds.map(
     preprocess_function, 
     remove_columns=[c for c in train_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=32,
+    batch_size=8,
     #num_proc=8,
 )
 
@@ -170,7 +165,7 @@ valid_ds_encoded = valid_ds.map(
     preprocess_function, 
     remove_columns=[c for c in valid_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=32,
+    batch_size=8,
     #num_proc=8,
 )
 
@@ -202,13 +197,14 @@ class MMSForCentroid(nn.Module):
     def __init__(self, model_id, config):
         super().__init__()
         self.mms = AutoModel.from_pretrained(model_id, config=config)
-        # parameters that stay consistent across batches
-        self.prototypes = nn.Parameter(torch.randn(config.num_labels, config.hidden_size))
+        # parameters that stay consistent across batches (calculate prototypes over all batches)
+        self.prototypes = nn.Parameter(torch.randn(config.num_labels, config.hidden_size) * 0.01)
 
     def forward(self, input_values, attention_mask=None, labels=None):
         outputs = self.mms(input_values=input_values, attention_mask=attention_mask)
         # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
         embeddings = outputs.last_hidden_state.mean(dim=1)
+        # squared second norm of distance
         distances = torch.cdist(embeddings, self.prototypes, p=2).pow(2)
         return {"logits": -distances, "last_hidden_state": outputs.last_hidden_state}
 
@@ -230,7 +226,7 @@ class CentroidTrainer(Trainer):
     """
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.get("labels")
-        # distance calculation is in the model
+        # distance calculation is in the model (forward)
         outputs = model(input_values=inputs.get("input_values"), attention_mask=inputs.get("attention_mask"))
         logits = outputs["logits"]
 
@@ -240,35 +236,6 @@ class CentroidTrainer(Trainer):
         if return_outputs:
             return loss, {"logits": logits}
         return loss
-
-
-        labels = inputs.get("labels")
-        outputs = model(input_values=inputs.get("input_values"), attention_mask=inputs.get("attention_mask"))
-
-        # find embeddings
-        # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
-        embeddings = outputs["logits"]
-        device = embeddings.device
-        num_classes = 22
-
-        # calculate centroids for each class
-        # indices point to the columns in distance calculation
-        centroids = torch.zeros((num_classes, embeddings.shape[-1]), device=device)
-
-        unique_labels = torch.unique(labels)
-        for label in unique_labels:
-            mask = (labels == label)
-            centroids[label] = embeddings[mask].mean(dim=0)
-
-        distances = torch.cdist(embeddings, centroids, p=2).pow(2)
-
-        logits = -distances
-
-        loss = F.cross_entropy(logits, labels)
-        if return_outputs:
-            return loss, {"logits": logits}
-        return loss
-    
         
 # %%
 # create collator for padding
@@ -304,10 +271,10 @@ data_collator = AudioDataCollator(feature_extractor)
 
 # %%
 batch_size = 8
-gradient_accumulation_steps = 4
-num_train_epochs_stage1 = 2
+gradient_accumulation_steps = 8
+num_train_epochs_stage1 = 5
 num_train_epochs_stage2 = 20
-lr_stage1 = 0.0002
+lr_stage1 = 1e-5
 lr_stage2 = 0.00001
 
 # %%
@@ -377,15 +344,15 @@ freeze_encoder(slid_model)
 
 # %%
 training_args_stage1 = TrainingArguments(
-    #group_by_length=False,
+    group_by_length=False,
     report_to="wandb",
-    logging_steps=10,                                               #CHANGE TO 25
+    logging_steps=15,
     per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=2,                                   #CHANGE TO BATCHSIZE
+    per_device_eval_batch_size=batch_size,
     eval_strategy="steps",
-    eval_steps=444,                                                 #CHANGE TO 500
+    eval_steps=20,
     save_strategy="steps",
-    save_steps=444,                                                 #CHANGE TO 500
+    save_steps=20,
     learning_rate=lr_stage1,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -399,8 +366,7 @@ training_args_stage1 = TrainingArguments(
     fp16=True,
     max_grad_norm=1.0,
     push_to_hub=False,
-    eval_accumulation_steps=10,
-    dataloader_num_workers=0  # stop the multithread deadlock
+    eval_accumulation_steps=15
 )
 
 # %%
@@ -409,10 +375,9 @@ trainer_stage1 = CentroidTrainer(
     training_args_stage1,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
-    processing_class=feature_extractor, # changed from tokenizer                                CHANGE BACK
+    processing_class=feature_extractor,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+    compute_metrics=compute_metrics
 )
 
 # %%
@@ -424,15 +389,14 @@ unfreeze_encoder(slid_model)
 
 # %%
 training_args_stage2 = TrainingArguments(
-    #group_by_length=False,
     report_to="wandb",
-    logging_steps=10,                                               # CHANGE TO 25
+    logging_steps=10,
     per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=2,                                   # CHANGE TO BATCHSIZE
+    per_device_eval_batch_size=batch_size,
     eval_strategy="steps",
-    eval_steps=444,                                                 # CHANGE TO 500
+    eval_steps=20,
     save_strategy="steps",
-    save_steps=444,                                                 # CHANGE TO 500
+    save_steps=20,
     learning_rate=lr_stage2,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -446,9 +410,10 @@ training_args_stage2 = TrainingArguments(
     fp16=True,
     max_grad_norm=1.0,
     push_to_hub=False,
-    eval_accumulation_steps=10,  # moves results to cpu ram every 10 batches
-    dataloader_num_workers=0  # stop the multithread deadlock
+    eval_accumulation_steps=15
 )
+
+training_args_stage2.output_dir = "./slid_stage2_results"
 
 # %%
 trainer = CentroidTrainer(
@@ -456,15 +421,15 @@ trainer = CentroidTrainer(
     training_args_stage2,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
-    processing_class=feature_extractor, # changed from tokenizer                                CHANGE BACK
+    processing_class=feature_extractor,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
 )
 
 # %%
 print("Train loop starting (stage 2: full finetune)")
-trainer.train(resume_from_checkpoint=True)
+trainer.train(resume_from_checkpoint=False)
 
 # %%
 def plot_embeddings(model, dataset, str_to_int, num_samples=500):
@@ -477,26 +442,29 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
     subset = dataset.select(range(min(num_samples, len(dataset))))
     dataloader = torch.utils.data.DataLoader(subset, batch_size=8, collate_fn=data_collator)
 
-    with torch.no_grad():
+    with torch.no_grad(): # save memory and speed up inference
         for batch in dataloader:
             inputs = {k: v.to(model_device) for k, v in batch.items() if k != "labels"}
+            # decide on encoder
             if hasattr(model, "mms"):
                 backbone = model.mms
             elif hasattr(model, "wav2vec2"):
                 backbone = model.wav2vec2
             else:
                 backbone = model
-            output = backbone(**inputs)
+            output = backbone(**inputs) # forward pass
+            # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
             embedding = output.last_hidden_state.mean(dim=1)
+
             embeddings.append(embedding.cpu())
             labels.append(batch["labels"])
-
+    # combine batches in large arrays
     embeddings = torch.cat(embeddings).numpy()
     labels = torch.cat(labels).numpy()
 
     # 2D
     tsne = TSNE(n_components=2, random_state=42)
-    reduced = tsne.fit_transform(embeddings)
+    reduced = tsne.fit_transform(embeddings) #fits into higher-dim and transforms into lower-dim
 
     plt.figure(figsize=(12, 8))
     for i, lang in enumerate(str_to_int.keys()):
@@ -512,20 +480,21 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
 
 def plot_confusion_matrix(trainer, dataset, labels):
     output = trainer.predict(dataset)
-
+    # for each input chooses the predicted language based on the highest score
     predictions = np.argmax(output.predictions, axis=-1)
 
-    true_labels = output.label_ids
-    if true_labels is None:
-        true_labels = np.array(dataset["label"])
-
-    cm = confusion_matrix(true_labels, predictions)
+    true_labels = np.array(dataset["label"])
+    conf_matrix = confusion_matrix(true_labels, predictions)
 
     fig, ax = plt.subplots(figsize=(16, 16))  # Large size for 22 labels
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp = ConfusionMatrixDisplay(confusion_matrix=conf_matrix, display_labels=labels)
+
+    # cmap="Blues" -> darker blue means == samples in that cell
+    # xticks_rotation='vertical' -> prevents long language names from overlapping
+    # values_format='d' -> integers in cells
     disp.plot(cmap="Blues", ax=ax, xticks_rotation='vertical', values_format='d')
-    plt.title("Confusion Matrix: Prototypical Centroid Network (22 Languages)")
-    plt.tight_layout()  # Prevents labels from being cut off
+    plt.title("Confusion Matrix: Task 2")
+    plt.tight_layout()
     plt.savefig("confusion_matrix.png")
     wandb.log({"plots/confusion_matrix": wandb.Image("confusion_matrix.png")})
     plt.show()
