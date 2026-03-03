@@ -1,5 +1,5 @@
-# %%
 import os
+# %%
 from datetime import datetime
 
 current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -19,6 +19,11 @@ from torch import nn
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+
+import random
+import torchaudio
+import torchaudio.functional as AF
+import torchaudio.transforms as AT
 
 from datasets import (
     load_dataset, 
@@ -58,14 +63,12 @@ print(f"torch.cuda.get_device_name(): {torch.cuda.get_device_name()}")
 # %%
 # login to Hugging Face
 hf_key = os.environ.get("HF_KEY")
-if hf_key:
-    login(token=hf_key)
+login(token=hf_key)
 
 # %%
 # login to WANDB
 wandb_key = os.environ.get("WANDB_KEY")
-if wandb_key:
-    wandb.login(key=wandb_key)
+wandb.login(key=wandb_key)
 
 # %%
 model_id = "facebook/mms-300m"
@@ -146,7 +149,7 @@ def preprocess_function(examples):
     return inputs
 
 # %%
-keep_cols = ['speaker_id', 'language']
+keep_cols = ['speaker_id', 'language', 'audio_filepath']
 
 # %% [markdown]
 # ## encode the train and valid splits
@@ -156,7 +159,7 @@ train_ds_encoded = train_ds.map(
     preprocess_function, 
     remove_columns=[c for c in train_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=8,
+    batch_size=32,
     #num_proc=8,
 )
 
@@ -165,7 +168,7 @@ valid_ds_encoded = valid_ds.map(
     preprocess_function, 
     remove_columns=[c for c in valid_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=8,
+    batch_size=32,
     #num_proc=8,
 )
 
@@ -183,14 +186,14 @@ config.num_labels=num_labels
 config.label2id=str_to_int
 config.id2label=int_to_str
 
-do_apply_dropout = True
+do_apply_dropout = False
 
 # check if dropout is enabled
 if do_apply_dropout:
     config.hidden_dropout = 0.1           # Dropout for hidden states
     config.attention_dropout = 0.1        # Dropout in attention layers
     config.activation_dropout = 0.1       # Dropout after activation functions
-    config.feat_proj_dropout = 0.1
+    config.feat_proj_dropout = 0.1   
 
 # %%
 class MMSForCentroid(nn.Module):
@@ -236,7 +239,7 @@ class CentroidTrainer(Trainer):
         if return_outputs:
             return loss, {"logits": logits}
         return loss
-        
+
 # %%
 # create collator for padding
 class AudioDataCollator:
@@ -271,23 +274,19 @@ data_collator = AudioDataCollator(feature_extractor)
 
 # %%
 batch_size = 8
-gradient_accumulation_steps = 8
-num_train_epochs_stage1 = 5
-num_train_epochs_stage2 = 20
-lr_stage1 = 1e-5
-lr_stage2 = 0.00001
+gradient_accumulation_steps = 2
+num_train_epochs = 20
+lr = 0.00002
 
 # %%
-wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr_stage2}_{current_time_str}")
+wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
 
 if wandb.config is not None:
     if "batch_size" in wandb.config: batch_size = int(wandb.config["batch_size"])
     if "gradient_accumulation_steps" in wandb.config: gradient_accumulation_steps = int(
         wandb.config["gradient_accumulation_steps"])
-    if "num_train_epochs_stage1" in wandb.config: num_train_epochs_stage1 = int(wandb.config["num_train_epochs_stage1"])
-    if "num_train_epochs_stage2" in wandb.config: num_train_epochs_stage2 = int(wandb.config["num_train_epochs_stage2"])
-    if "lr_stage1" in wandb.config: lr_stage1 = float(wandb.config["lr_stage1"])
-    if "lr_stage2" in wandb.config: lr_stage2 = float(wandb.config["lr_stage2"])
+    if "num_train_epochs" in wandb.config: num_train_epochs = int(wandb.config["num_train_epochs"])
+    if "lr" in wandb.config: lr = float(wandb.config["lr"])
     if "max_duration" in wandb.config: max_duration = int(wandb.config["max_duration"])
     if "warmup_ratio" in wandb.config: pass
     if "weight_decay" in wandb.config: pass
@@ -316,63 +315,34 @@ def compute_metrics(eval_pred):
 
 
 # %%
-def _get_encoder(m):
-    for a in ("wav2vec2", "hubert", "w2v2_bert", "encoder", "model"):
-        if hasattr(m, a):
-            return getattr(m, a)
-    return None
-
-
-def freeze_encoder(m):
-    enc = _get_encoder(m)
-    if enc is None:
-        return
-    for p in enc.parameters():
-        p.requires_grad = False
-
-
-def unfreeze_encoder(m):
-    enc = _get_encoder(m)
-    if enc is None:
-        return
-    for p in enc.parameters():
-        p.requires_grad = True
-
-
-# %%
-freeze_encoder(slid_model)
-
-# %%
-training_args_stage1 = TrainingArguments(
+training_args = TrainingArguments(
     group_by_length=False,
     report_to="wandb",
-    logging_steps=15,
+    logging_steps=25,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    eval_strategy="steps",
-    eval_steps=20,
-    save_strategy="steps",
-    save_steps=20,
-    learning_rate=lr_stage1,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=lr,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
-    num_train_epochs=num_train_epochs_stage1,
+    num_train_epochs=num_train_epochs,
     weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
     warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
     load_best_model_at_end=True,
-    metric_for_best_model="f1",
+    metric_for_best_model="accuracy",
     greater_is_better=True,
     save_total_limit=2,
-    fp16=True,
+    fp16=torch.cuda.is_available(),
     max_grad_norm=1.0,
     push_to_hub=False,
     eval_accumulation_steps=15
 )
 
 # %%
-trainer_stage1 = CentroidTrainer(
+trainer = CentroidTrainer(
     slid_model,
-    training_args_stage1,
+    training_args,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
     processing_class=feature_extractor,
@@ -381,55 +351,8 @@ trainer_stage1 = CentroidTrainer(
 )
 
 # %%
-print("Train loop starting (stage 1: head-only)")
-trainer_stage1.train()
-
-# %%
-unfreeze_encoder(slid_model)
-
-# %%
-training_args_stage2 = TrainingArguments(
-    report_to="wandb",
-    logging_steps=10,
-    per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=batch_size,
-    eval_strategy="steps",
-    eval_steps=20,
-    save_strategy="steps",
-    save_steps=20,
-    learning_rate=lr_stage2,
-    lr_scheduler_type="cosine",
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    num_train_epochs=num_train_epochs_stage2,
-    weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
-    warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
-    load_best_model_at_end=True,
-    metric_for_best_model="f1",
-    greater_is_better=True,
-    save_total_limit=2,
-    fp16=True,
-    max_grad_norm=1.0,
-    push_to_hub=False,
-    eval_accumulation_steps=15
-)
-
-training_args_stage2.output_dir = "./slid_stage2_results"
-
-# %%
-trainer = CentroidTrainer(
-    slid_model,
-    training_args_stage2,
-    train_dataset=train_ds_encoded,
-    eval_dataset=valid_ds_encoded,
-    processing_class=feature_extractor,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
-)
-
-# %%
-print("Train loop starting (stage 2: full finetune)")
-trainer.train(resume_from_checkpoint=False)
+print("Train loop starting...")
+trainer.train()
 
 # %%
 def plot_embeddings(model, dataset, str_to_int, num_samples=500):
