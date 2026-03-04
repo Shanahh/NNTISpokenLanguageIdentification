@@ -123,11 +123,24 @@ AUG_SNR_MIN = 10.0  # dB
 AUG_SNR_MAX = 25.0
 
 
+# Peak-normalize (clamp) an audio waveform to prevent clipping after augmentations.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   peak: float, target maximum absolute amplitude after normalization.
+# Output:
+#   1D torch.Tensor with the same shape as x, scaled only if max(|x|) > peak.
 def _clamp_audio(x, peak=0.99):
     m = x.abs().max().clamp(min=1e-6)
     return (x / m) * peak if m > peak else x
 
 
+# Apply a random circular time shift to an audio waveform to reduce sensitivity to alignment.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   max_shift_ms: int/float, maximum time shift in milliseconds (both directions).
+#   sr: int, sampling rate in Hz used to convert milliseconds to samples.
+# Output:
+#   1D torch.Tensor with the same shape as x, circularly shifted by a random amount.
 def random_time_shift(x, max_shift_ms=AUG_SHIFT_MS, sr=SR_AUG):
     max_shift = int(sr * max_shift_ms / 1000)
     if max_shift <= 0:
@@ -136,12 +149,26 @@ def random_time_shift(x, max_shift_ms=AUG_SHIFT_MS, sr=SR_AUG):
     return torch.roll(x, shifts=shift)
 
 
+# Apply a random gain (volume change) in decibels to simulate recording-level variation.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   min_db: float, minimum gain in dB.
+#   max_db: float, maximum gain in dB.
+# Output:
+#   1D torch.Tensor with the same shape as x, scaled by a random gain and then clamped.
 def random_gain(x, min_db=-6.0, max_db=6.0):
     db = random.uniform(min_db, max_db)
     g = 10 ** (db / 20)
     return _clamp_audio(x * g)
 
 
+# Add Gaussian noise at a randomly sampled SNR to simulate background noise/channel noise.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   snr_db_min: float, minimum signal-to-noise ratio in dB.
+#   snr_db_max: float, maximum signal-to-noise ratio in dB.
+# Output:
+#   1D torch.Tensor with the same shape as x, with added noise at the selected SNR and clamped.
 def add_noise(x, snr_db_min=AUG_SNR_MIN, snr_db_max=AUG_SNR_MAX):
     snr_db = random.uniform(snr_db_min, snr_db_max)
     sig_power = x.pow(2).mean().clamp(min=1e-9)
@@ -152,6 +179,15 @@ def add_noise(x, snr_db_min=AUG_SNR_MIN, snr_db_max=AUG_SNR_MAX):
     return _clamp_audio(y)
 
 
+# Perform speed perturbation by resampling to a random rate and back to the original sampling rate.
+# This changes speaking rate/tempo slightly while keeping the sampling rate consistent for the model.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   sr: int, original sampling rate in Hz.
+#   min_rate: float, minimum speed perturbation factor (<1.0 slows down).
+#   max_rate: float, maximum speed perturbation factor (>1.0 speeds up).
+# Output:
+#   1D torch.Tensor containing the speed-perturbed waveform (length may change slightly).
 def speed_perturb_resample(x, sr=SR_AUG, min_rate=AUG_SPEED_MIN, max_rate=AUG_SPEED_MAX):
     rate = random.uniform(min_rate, max_rate)
     if abs(rate - 1.0) < 1e-3:
@@ -162,6 +198,14 @@ def speed_perturb_resample(x, sr=SR_AUG, min_rate=AUG_SPEED_MIN, max_rate=AUG_SP
     return y
 
 
+# Apply a random pitch shift (in semitones) to reduce dependence on speaker pitch characteristics.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+#   sr: int, sampling rate in Hz (required by the pitch shift operation).
+#   min_semitones: float, minimum pitch shift in semitones (negative lowers pitch).
+#   max_semitones: float, maximum pitch shift in semitones (positive raises pitch).
+# Output:
+#   1D torch.Tensor with the same shape as x, pitch-shifted and clamped.
 def pitch_shift(x, sr=SR_AUG, min_semitones=AUG_PITCH_MIN, max_semitones=AUG_PITCH_MAX):
     n_steps = random.uniform(min_semitones, max_semitones)
     if abs(n_steps) < 1e-3:
@@ -170,6 +214,13 @@ def pitch_shift(x, sr=SR_AUG, min_semitones=AUG_PITCH_MIN, max_semitones=AUG_PIT
     return _clamp_audio(y)
 
 
+# Apply a randomized sequence of waveform augmentations with overall probability AUGMENT_PROB.
+# Intended to improve robustness by simulating variations in loudness, alignment, speaking rate,
+# pitch, and background noise, while preserving the language label.
+# Inputs:
+#   x: 1D torch.Tensor of shape [T] containing the audio waveform samples.
+# Output:
+#   1D torch.Tensor containing the augmented waveform (or the original if not applied).
 def apply_random_augmentation(x):
     if (not ENABLE_AUGMENTATION) or (random.random() > AUGMENT_PROB):
         return x
