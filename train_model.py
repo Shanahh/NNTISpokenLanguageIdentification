@@ -20,6 +20,8 @@ import torchaudio
 import torchaudio.functional as AF
 import torchaudio.transforms as AT
 
+import argparse
+
 from datasets import (
     load_dataset, 
     Audio
@@ -47,6 +49,20 @@ from huggingface_hub import login
 # import Hugging Face libraries
 import evaluate
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_id", type=str, default="facebook/mms-300m", choices=["utter-project/mHuBERT-147", "facebook/wav2vec2-xls-r-300m", "facebook/w2v-bert-2.0", "facebook/mms-300m"])
+
+parser.add_argument("--enable_augmentation", action="store_true")
+parser.add_argument("--augment_prob", type=float, default=0.8)
+
+parser.add_argument("--enable_gain", action="store_true")
+parser.add_argument("--enable_time_shift", action="store_true")
+parser.add_argument("--enable_speed_perturb", action="store_true")
+parser.add_argument("--enable_pitch_shift", action="store_true")
+parser.add_argument("--enable_noise", action="store_true")
+
+args, _ = parser.parse_known_args()
+
 # %%
 # check if there GPU
 print("Check if GPU available:")
@@ -66,9 +82,7 @@ wandb_key = os.environ.get("WANDB_KEY")
 wandb.login(key=wandb_key)
 
 # %%
-model_id = "facebook/mms-300m"
-#model_id = "utter-project/mHuBERT-147"
-#model_id = "facebook/wav2vec2-xls-r-300m"
+model_id = args.model_id
 
 
 # %%
@@ -121,6 +135,32 @@ AUG_SPEED_MAX = 1.1
 AUG_SHIFT_MS = 50  # max time shift (ms)
 AUG_SNR_MIN = 10.0  # dB
 AUG_SNR_MAX = 25.0
+
+ENABLE_GAIN = False
+ENABLE_TIME_SHIFT = False
+ENABLE_SPEED_PERTURB = False
+ENABLE_PITCH_SHIFT = False
+ENABLE_NOISE = False
+
+if args.enable_augmentation:
+    ENABLE_AUGMENTATION = True
+
+AUGMENT_PROB = float(args.augment_prob)
+
+any_specific = any([
+    args.enable_gain,
+    args.enable_time_shift,
+    args.enable_speed_perturb,
+    args.enable_pitch_shift,
+    args.enable_noise,
+])
+
+if ENABLE_AUGMENTATION and any_specific:
+    ENABLE_GAIN = bool(args.enable_gain)
+    ENABLE_TIME_SHIFT = bool(args.enable_time_shift)
+    ENABLE_SPEED_PERTURB = bool(args.enable_speed_perturb)
+    ENABLE_PITCH_SHIFT = bool(args.enable_pitch_shift)
+    ENABLE_NOISE = bool(args.enable_noise)
 
 
 # Peak-normalize (clamp) an audio waveform to prevent clipping after augmentations.
@@ -224,15 +264,15 @@ def pitch_shift(x, sr=SR_AUG, min_semitones=AUG_PITCH_MIN, max_semitones=AUG_PIT
 def apply_random_augmentation(x):
     if (not ENABLE_AUGMENTATION) or (random.random() > AUGMENT_PROB):
         return x
-    if random.random() < 0.5:
+    if ENABLE_GAIN and random.random() < 0.5:
         x = random_gain(x)
-    if random.random() < 0.7:
+    if ENABLE_TIME_SHIFT and random.random() < 0.7:
         x = random_time_shift(x)
-    if random.random() < 0.7:
+    if ENABLE_SPEED_PERTURB and random.random() < 0.7:
         x = speed_perturb_resample(x)
-    if random.random() < 0.5:
+    if ENABLE_PITCH_SHIFT and random.random() < 0.5:
         x = pitch_shift(x)
-    if random.random() < 0.5:
+    if ENABLE_NOISE and random.random() < 0.5:
         x = add_noise(x)
     return x
 
