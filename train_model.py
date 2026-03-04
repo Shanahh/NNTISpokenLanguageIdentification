@@ -109,7 +109,7 @@ else:
 max_duration = 7 # in seconds
 
 # %%
-# Augmentation toggles (enable/disable as needed)
+# Augmentation toggles
 ENABLE_AUGMENTATION = False
 AUGMENT_PROB = 0.8  # probability to apply augmentation per sample
 SR_AUG = 16000
@@ -121,10 +121,6 @@ AUG_SPEED_MAX = 1.1
 AUG_SHIFT_MS = 50  # max time shift (ms)
 AUG_SNR_MIN = 10.0  # dB
 AUG_SNR_MAX = 25.0
-
-ENABLE_SPEC_AUGMENT = False
-SPEC_TIME_MASK_PARAM = 30
-SPEC_NUM_TIME_MASKS = 2
 
 
 def _clamp_audio(x, peak=0.99):
@@ -188,21 +184,6 @@ def apply_random_augmentation(x):
     if random.random() < 0.5:
         x = add_noise(x)
     return x
-
-
-def _maybe_spec_augment_input_values(x, attention_mask=None):
-    if not ENABLE_SPEC_AUGMENT:
-        return x
-    if x.dim() != 2:
-        return x
-    tm = AT.TimeMasking(time_mask_param=SPEC_TIME_MASK_PARAM)
-    y = x.unsqueeze(1)  # [B, 1, T]
-    for _ in range(SPEC_NUM_TIME_MASKS):
-        y = tm(y)
-    y = y.squeeze(1)
-    if attention_mask is not None:
-        y = y * attention_mask.to(y.dtype)
-    return y
 
 
 # %%
@@ -341,12 +322,6 @@ class AudioDataCollator:
             padding=True,
             return_tensors="pt"
         )
-
-        if input_features_key in batch:
-            batch[input_features_key] = _maybe_spec_augment_input_values(
-                batch[input_features_key],
-                attention_mask=batch.get("attention_mask", None)
-            )
 
         # add labels
         batch["labels"] = torch.tensor(
