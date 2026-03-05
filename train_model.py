@@ -19,6 +19,7 @@ from torch import nn
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+from torch.optim import AdamW
 
 import random
 import torchaudio
@@ -111,7 +112,7 @@ else:
     input_features_key = "input_values"
 
 # %%
-max_duration = 7 # in seconds
+max_duration = 4 # in seconds
 
 # %%
 # get the set of languages
@@ -159,7 +160,7 @@ train_ds_encoded = train_ds.map(
     preprocess_function, 
     remove_columns=[c for c in train_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=32,
+    batch_size=16,
     #num_proc=8,
 )
 
@@ -168,7 +169,7 @@ valid_ds_encoded = valid_ds.map(
     preprocess_function, 
     remove_columns=[c for c in valid_ds.column_names if c not in keep_cols],
     batched=True,
-    batch_size=32,
+    batch_size=16,
     #num_proc=8,
 )
 
@@ -186,14 +187,14 @@ config.num_labels=num_labels
 config.label2id=str_to_int
 config.id2label=int_to_str
 
-do_apply_dropout = False
+do_apply_dropout = True
 
 # check if dropout is enabled
 if do_apply_dropout:
-    config.hidden_dropout = 0.1           # Dropout for hidden states
-    config.attention_dropout = 0.1        # Dropout in attention layers
-    config.activation_dropout = 0.1       # Dropout after activation functions
-    config.feat_proj_dropout = 0.1   
+    config.hidden_dropout = 0.2           # Dropout for hidden states
+    config.attention_dropout = 0.2        # Dropout in attention layers
+    config.activation_dropout = 0.2       # Dropout after activation functions
+    config.feat_proj_dropout = 0.2
 
 # %%
 class MMSForCentroid(nn.Module):
@@ -201,15 +202,30 @@ class MMSForCentroid(nn.Module):
         super().__init__()
         self.mms = AutoModel.from_pretrained(model_id, config=config)
         # parameters that stay consistent across batches (calculate prototypes over all batches)
-        self.prototypes = nn.Parameter(torch.randn(config.num_labels, config.hidden_size) * 0.01)
+        # self.prototypes = nn.Parameter(torch.randn(config.num_labels, config.hidden_size) * 0.01)
+        # self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.prototypes = nn.Parameter(torch.empty(config.num_labels, config.hidden_size))
+        nn.init.orthogonal_(self.prototypes)
 
     def forward(self, input_values, attention_mask=None, labels=None):
         outputs = self.mms(input_values=input_values, attention_mask=attention_mask)
         # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
-        embeddings = outputs.last_hidden_state.mean(dim=1)
-        # squared second norm of distance
-        distances = torch.cdist(embeddings, self.prototypes, p=2).pow(2)
-        return {"logits": -distances, "last_hidden_state": outputs.last_hidden_state}
+        mean_pool = outputs.last_hidden_state.mean(dim=1)
+        max_pool = outputs.last_hidden_state.max(dim=1)[0]
+        embeddings = (mean_pool + max_pool) / 2
+
+        # normalize embeddings and prototypes
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        normalized_protos = F.normalize(self.prototypes, p=2, dim=1)
+
+        # cosine similarity
+        s = 13.0 # help the softmax converge
+        logits = torch.matmul(embeddings, normalized_protos.t()) * s
+        # # squared second norm of distance
+        # distances = torch.cdist(embeddings, normalized_protos, p=2).pow(2)
+        # #divide by temperature to prevent distances from dominating softmax
+        # logits = -distances / self.temperature
+        return {"logits": logits, "last_hidden_state": outputs.last_hidden_state}
 
     def save_pretrained(self, save_directory):
         if not os.path.exists(save_directory):
@@ -234,7 +250,21 @@ class CentroidTrainer(Trainer):
         logits = outputs["logits"]
 
         # cross entropy for -distances
-        loss = F.cross_entropy(logits, labels)
+        ce_loss = F.cross_entropy(logits, labels)
+
+        embeddings = outputs["last_hidden_state"].mean(dim=1)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        target_prototypes = F.normalize(model.prototypes[labels], p=2, dim=1)
+
+        # prototypes = model.prototypes
+        # prototype_similarity = F.cosine_similarity(prototypes.unsqueeze(1), prototypes.unsqueeze(0), dim=-1)
+        # # penalize high similarity between different prototypes
+        # reg_loss = (prototype_similarity.triu(diagonal=1) ** 2).mean()
+        #
+        # loss = ce_loss + 0.1 * reg_loss
+
+        compact_loss = F.mse_loss(embeddings, target_prototypes)
+        loss = ce_loss + 0.1 * compact_loss
 
         if return_outputs:
             return loss, {"logits": logits}
@@ -273,10 +303,10 @@ class AudioDataCollator:
 data_collator = AudioDataCollator(feature_extractor)
 
 # %%
-batch_size = 8
-gradient_accumulation_steps = 2
+batch_size = 12
+gradient_accumulation_steps = 4
 num_train_epochs = 20
-lr = 0.00002
+lr = 3e-5
 
 # %%
 wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
@@ -318,40 +348,60 @@ def compute_metrics(eval_pred):
 training_args = TrainingArguments(
     group_by_length=False,
     report_to="wandb",
-    logging_steps=25,
+    logging_steps=10,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
+    evaluation_strategy="steps",
+    eval_steps=50,
+    save_strategy="steps",
+    save_steps=50,
     learning_rate=lr,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
     num_train_epochs=num_train_epochs,
-    weight_decay=float(getattr(wandb.config, "weight_decay", 0.01)) if wandb.config is not None else 0.01,
+    weight_decay=float(getattr(wandb.config, "weight_decay", 0.1)) if wandb.config is not None else 0.1,
     warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
     load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
+    metric_for_best_model="f1",
     greater_is_better=True,
     save_total_limit=2,
     fp16=torch.cuda.is_available(),
     max_grad_norm=1.0,
     push_to_hub=False,
-    eval_accumulation_steps=15
+    eval_accumulation_steps=15,
+    warmup_steps=1000,
+    label_smoothing_factor=0.1
 )
 
 # %%
+optimizer_grouped_parameters = [
+    {
+        "params": [p for n, p in slid_model.mms.named_parameters()],
+        "lr": 2e-5, # smaller for the pre-trained expert
+    },
+    {
+        "params": [slid_model.prototypes],
+        "lr": 3e-5, # larger for new centroids
+    },
+]
+
+# custom optimizer
+optimizer = AdamW(optimizer_grouped_parameters, weight_decay=training_args.weight_decay)
+
 trainer = CentroidTrainer(
-    slid_model,
-    training_args,
+    model=slid_model,
+    args=training_args,
     train_dataset=train_ds_encoded,
     eval_dataset=valid_ds_encoded,
     processing_class=feature_extractor,
     data_collator=data_collator,
-    compute_metrics=compute_metrics
+    compute_metrics=compute_metrics,
+    optimizers=(optimizer, None),
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=20)]
 )
 
 # %%
-print("Train loop starting...")
+print("Train loop starting...great model please work")
 trainer.train()
 
 # %%
@@ -363,7 +413,7 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
 
     # smaller set for visualization
     subset = dataset.select(range(min(num_samples, len(dataset))))
-    dataloader = torch.utils.data.DataLoader(subset, batch_size=8, collate_fn=data_collator)
+    dataloader = torch.utils.data.DataLoader(subset, batch_size=16, collate_fn=data_collator)
 
     with torch.no_grad(): # save memory and speed up inference
         for batch in dataloader:
