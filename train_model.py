@@ -501,7 +501,7 @@ data_collator = AudioDataCollator(feature_extractor)
 # %%
 batch_size = 12
 gradient_accumulation_steps = 4
-num_train_epochs = 20
+num_train_epochs = 35
 lr = 3e-5
 
 # %%
