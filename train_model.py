@@ -126,12 +126,12 @@ else:
     input_features_key = "input_values"
 
 # %%
-max_duration = 7 # in seconds
+max_duration = 4 # in seconds
 
 # %%
 # Augmentation toggles
 ENABLE_AUGMENTATION = False
-AUGMENT_PROB = 0.8  # probability to apply augmentation per sample
+AUGMENT_PROB = 0.15  # probability to apply augmentation per sample
 SR_AUG = 16000
 
 AUG_PITCH_MIN = -2.0  # semitones
@@ -270,15 +270,15 @@ def pitch_shift(x, sr=SR_AUG, min_semitones=AUG_PITCH_MIN, max_semitones=AUG_PIT
 def apply_random_augmentation(x):
     if (not ENABLE_AUGMENTATION) or (random.random() > AUGMENT_PROB):
         return x
-    if ENABLE_GAIN and random.random() < 0.5:
+    if ENABLE_GAIN and random.random() < 0.1:
         x = random_gain(x)
-    if ENABLE_TIME_SHIFT and random.random() < 0.7:
+    if ENABLE_TIME_SHIFT and random.random() < 0.2:
         x = random_time_shift(x)
-    if ENABLE_SPEED_PERTURB and random.random() < 0.7:
+    if ENABLE_SPEED_PERTURB and random.random() < 0.1:
         x = speed_perturb_resample(x)
-    if ENABLE_PITCH_SHIFT and random.random() < 0.5:
+    if ENABLE_PITCH_SHIFT and random.random() < 0.1:
         x = pitch_shift(x)
-    if ENABLE_NOISE and random.random() < 0.5:
+    if ENABLE_NOISE and random.random() < 0.2:
         x = add_noise(x)
     return x
 
@@ -296,8 +296,20 @@ str_to_int = {
 
 
 # %%
+def random_crop(audio, max_samples):
+    # randomly choose part of audio if > max duration
+    if len(audio) <= max_samples:
+        return audio
+    start = random.randint(0, len(audio) - max_samples)
+    return audio[start:start + max_samples]
+
 def preprocess_function(examples):
-    audio_arrays = [x["array"] for x in examples["audio_filepath"]]
+    max_samples = int(feature_extractor.sampling_rate * max_duration) # maximum allowed sample count
+
+    audio_arrays = [
+        random_crop(x["array"], max_samples)
+        for x in examples["audio_filepath"]
+    ]
 
     inputs = feature_extractor(
         audio_arrays, 
@@ -330,7 +342,7 @@ train_ds_encoded = train_ds.map(
     remove_columns=[c for c in train_ds.column_names if c not in keep_cols],
     batched=True,
     batch_size=16,
-    #num_proc=8,
+    num_proc=8,
 )
 
 # %%
@@ -367,34 +379,53 @@ if do_apply_dropout:
 
 # %%
 class MMSForCentroid(nn.Module):
+    """
+        Custom Spoken Language Identification (SLID) model with MMS backbone
+    """
     def __init__(self, model_id, config):
         super().__init__()
-        self.mms = AutoModel.from_pretrained(model_id, config=config)
-        # parameters that stay consistent across batches (calculate prototypes over all batches)
-        # self.prototypes = nn.Parameter(torch.randn(config.num_labels, config.hidden_size) * 0.01)
-        # self.temperature = nn.Parameter(torch.tensor(1.0))
-        self.prototypes = nn.Parameter(torch.empty(config.num_labels, config.hidden_size))
-        nn.init.orthogonal_(self.prototypes)
+        self.config = config
+        self.encoder = AutoModel.from_pretrained(model_id, config=config)
+        self.encoder.feature_extractor._freeze_parameters()
+        self.embedding = nn.Sequential(
+            nn.Linear(config.hidden_size, 256),
+            nn.LayerNorm(256)
+        )
+        self.centroids = nn.Parameter(torch.randn(config.num_labels, 256) * 0.01)
+        self.scale = nn.Parameter(torch.tensor(20.0))
 
     def forward(self, input_values, attention_mask=None, labels=None):
-        outputs = self.mms(input_values=input_values, attention_mask=attention_mask)
-        # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
-        mean_pool = outputs.last_hidden_state.mean(dim=1)
-        max_pool = outputs.last_hidden_state.max(dim=1)[0]
-        embeddings = (mean_pool + max_pool) / 2
+        outputs = self.encoder(input_values=input_values, attention_mask=attention_mask)
 
-        # normalize embeddings and prototypes
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        normalized_protos = F.normalize(self.prototypes, p=2, dim=1)
+        hidden_state = outputs.last_hidden_state # [batch_size, seq_len, hidden_dim]
 
-        # cosine similarity
-        s = 13.0 # help the softmax converge
-        logits = torch.matmul(embeddings, normalized_protos.t()) * s
-        # # squared second norm of distance
-        # distances = torch.cdist(embeddings, normalized_protos, p=2).pow(2)
-        # #divide by temperature to prevent distances from dominating softmax
-        # logits = -distances / self.temperature
-        return {"logits": logits, "last_hidden_state": outputs.last_hidden_state}
+        if attention_mask is not None:
+            batch_size, seq_len, _ = hidden_state.shape
+            # shrink our input mask to match hiiden seq_len
+            # average only over the actual speech frames (no padding)
+
+            subsampled_mask = attention_mask[:, ::attention_mask.shape[1] // seq_len]
+            # just if float math is off
+            subsampled_mask = subsampled_mask[:, :seq_len].float().unsqueeze(-1)
+
+            hidden_state = hidden_state * subsampled_mask
+            pooled = hidden_state.sum(dim=1) / subsampled_mask.sum(dim=1).clamp(min=1e-9)
+        else:
+            pooled = hidden_state.mean(dim=1)
+
+        embedding = self.embedding(pooled)
+        embedding = F.dropout(embedding, p=0.2, training=self.training)
+        embedding = F.normalize(embedding, dim=-1)
+        centroids = F.normalize(self.centroids, dim=-1)
+
+        # cosine similarity for centroids with scaling factor
+        logits = self.scale * torch.matmul(embedding, centroids.T)
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+
+        return {"loss": loss, "logits": logits}
 
     def save_pretrained(self, save_directory):
         if not os.path.exists(save_directory):
@@ -409,34 +440,16 @@ slid_model = MMSForCentroid(model_id, config)
 # %%
 class CentroidTrainer(Trainer):
     """
-    Centroid-based Classification
-    It computes the mean embedding for each class in the batch, then calculates the centroids and uses Euclidean distance for classification to the nearest one
+    Trainer for centroid-based classifier with learnable centroids
     """
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.get("labels")
-        # distance calculation is in the model (forward)
-        outputs = model(input_values=inputs.get("input_values"), attention_mask=inputs.get("attention_mask"))
-        logits = outputs["logits"]
-
-        # cross entropy for -distances
-        ce_loss = F.cross_entropy(logits, labels)
-
-        embeddings = outputs["last_hidden_state"].mean(dim=1)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        target_prototypes = F.normalize(model.prototypes[labels], p=2, dim=1)
-
-        # prototypes = model.prototypes
-        # prototype_similarity = F.cosine_similarity(prototypes.unsqueeze(1), prototypes.unsqueeze(0), dim=-1)
-        # # penalize high similarity between different prototypes
-        # reg_loss = (prototype_similarity.triu(diagonal=1) ** 2).mean()
-        #
-        # loss = ce_loss + 0.1 * reg_loss
-
-        compact_loss = F.mse_loss(embeddings, target_prototypes)
-        loss = ce_loss + 0.1 * compact_loss
+        # more like extract loss
+        labels = inputs["labels"]
+        outputs = model(input_values=inputs["input_values"], attention_mask=inputs["attention_mask"], labels=labels)
+        loss = outputs["loss"]
 
         if return_outputs:
-            return loss, {"logits": logits}
+            return loss, outputs
         return loss
 
 # %%
@@ -499,9 +512,9 @@ class AudioDataCollator:
 data_collator = AudioDataCollator(feature_extractor)
 
 # %%
-batch_size = 12
+batch_size = 32
 gradient_accumulation_steps = 4
-num_train_epochs = 35
+num_train_epochs = 15
 lr = 3e-5
 
 # %%
@@ -548,41 +561,28 @@ training_args = TrainingArguments(
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
     evaluation_strategy="steps",
-    eval_steps=50,
+    eval_steps=250,
     save_strategy="steps",
-    save_steps=50,
+    save_steps=500,
     learning_rate=lr,
     lr_scheduler_type="cosine",
     gradient_accumulation_steps=gradient_accumulation_steps,
     num_train_epochs=num_train_epochs,
-    weight_decay=float(getattr(wandb.config, "weight_decay", 0.1)) if wandb.config is not None else 0.1,
+    weight_decay=float(getattr(wandb.config, "weight_decay", 0.05)) if wandb.config is not None else 0.05,
     warmup_ratio=float(getattr(wandb.config, "warmup_ratio", 0.05)) if wandb.config is not None else 0.05,
     load_best_model_at_end=True,
     metric_for_best_model="f1",
     greater_is_better=True,
-    save_total_limit=2,
+    save_total_limit=1,
     fp16=torch.cuda.is_available(),
     max_grad_norm=1.0,
     push_to_hub=False,
     eval_accumulation_steps=15,
-    warmup_steps=1000,
-    label_smoothing_factor=0.1
+    warmup_steps=200,
+    label_smoothing_factor=0.05
 )
 
 # %%
-optimizer_grouped_parameters = [
-    {
-        "params": [p for n, p in slid_model.mms.named_parameters()],
-        "lr": 2e-5, # smaller for the pre-trained expert
-    },
-    {
-        "params": [slid_model.prototypes],
-        "lr": 3e-5, # larger for new centroids
-    },
-]
-
-# custom optimizer
-optimizer = AdamW(optimizer_grouped_parameters, weight_decay=training_args.weight_decay)
 
 trainer = CentroidTrainer(
     model=slid_model,
@@ -592,8 +592,7 @@ trainer = CentroidTrainer(
     processing_class=feature_extractor,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    optimizers=(optimizer, None),
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=20)]
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
 )
 
 # %%
@@ -611,22 +610,24 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
     subset = dataset.select(range(min(num_samples, len(dataset))))
     dataloader = torch.utils.data.DataLoader(subset, batch_size=16, collate_fn=data_collator)
 
-    with torch.no_grad(): # save memory and speed up inference
+    with torch.no_grad():  # save memory and speed up inference
         for batch in dataloader:
             inputs = {k: v.to(model_device) for k, v in batch.items() if k != "labels"}
-            # decide on encoder
-            if hasattr(model, "mms"):
-                backbone = model.mms
-            elif hasattr(model, "wav2vec2"):
-                backbone = model.wav2vec2
+            output = model.encoder(**inputs)
+            hidden_state = output.last_hidden_state
+            attention_mask = inputs.get("attention_mask")
+
+            if attention_mask is not None:
+                # same as in forward
+                mask = attention_mask.unsqueeze(-1)
+                hidden_state = hidden_state * mask
+                embedding = hidden_state.sum(dim=1) / mask.sum(dim=1)
             else:
-                backbone = model
-            output = backbone(**inputs) # forward pass
-            # hidden_states shape: [batch, sequence_length, hidden_size] -> mean over time dimension
-            embedding = output.last_hidden_state.mean(dim=1)
+                embedding = hidden_state.mean(dim=1)
 
             embeddings.append(embedding.cpu())
             labels.append(batch["labels"])
+
     # combine batches in large arrays
     embeddings = torch.cat(embeddings).numpy()
     labels = torch.cat(labels).numpy()
@@ -655,7 +656,7 @@ def plot_confusion_matrix(trainer, dataset, labels):
     true_labels = np.array(dataset["label"])
     conf_matrix = confusion_matrix(true_labels, predictions)
 
-    fig, ax = plt.subplots(figsize=(16, 16))  # Large size for 22 labels
+    fig, ax = plt.subplots(figsize=(16, 16))
     disp = ConfusionMatrixDisplay(confusion_matrix=conf_matrix, display_labels=labels)
 
     # cmap="Blues" -> darker blue means == samples in that cell
