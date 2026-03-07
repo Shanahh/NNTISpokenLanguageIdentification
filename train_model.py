@@ -131,7 +131,7 @@ max_duration = 4 # in seconds
 # %%
 # Augmentation toggles
 ENABLE_AUGMENTATION = False
-AUGMENT_PROB = 0.15  # probability to apply augmentation per sample
+AUGMENT_PROB = 0.3  # probability to apply augmentation per sample
 SR_AUG = 16000
 
 AUG_PITCH_MIN = -2.0  # semitones
@@ -296,6 +296,8 @@ str_to_int = {
 
 
 # %%
+# not covered in the documentation as this is a small adjustment to randomly
+# take part of audio if it is larger than max duration so if recordings have similar beginning we "added" some diversity
 def random_crop(audio, max_samples):
     # randomly choose part of audio if > max duration
     if len(audio) <= max_samples:
@@ -368,7 +370,7 @@ config.num_labels=num_labels
 config.label2id=str_to_int
 config.id2label=int_to_str
 
-do_apply_dropout = True
+do_apply_dropout = False
 
 # check if dropout is enabled
 if do_apply_dropout:
@@ -380,7 +382,7 @@ if do_apply_dropout:
 # %%
 class MMSForCentroid(nn.Module):
     """
-        Custom Spoken Language Identification (SLID) model with MMS backbone
+        Custom Spoken Language Identification model with MMS backbone
     """
     def __init__(self, model_id, config):
         super().__init__()
@@ -388,11 +390,10 @@ class MMSForCentroid(nn.Module):
         self.encoder = AutoModel.from_pretrained(model_id, config=config)
         self.encoder.feature_extractor._freeze_parameters()
         self.embedding = nn.Sequential(
-            nn.Linear(config.hidden_size, 256),
-            nn.LayerNorm(256)
+            nn.Linear(config.hidden_size, 512),
+            nn.LayerNorm(512)
         )
-        self.centroids = nn.Parameter(torch.randn(config.num_labels, 256) * 0.01)
-        self.scale = nn.Parameter(torch.tensor(20.0))
+        self.centroids = nn.Parameter(torch.zeros(config.num_labels, 512))
 
     def forward(self, input_values, attention_mask=None, labels=None):
         outputs = self.encoder(input_values=input_values, attention_mask=attention_mask)
@@ -414,12 +415,8 @@ class MMSForCentroid(nn.Module):
             pooled = hidden_state.mean(dim=1)
 
         embedding = self.embedding(pooled)
-        embedding = F.dropout(embedding, p=0.2, training=self.training)
-        embedding = F.normalize(embedding, dim=-1)
-        centroids = F.normalize(self.centroids, dim=-1)
-
-        # cosine similarity for centroids with scaling factor
-        logits = self.scale * torch.matmul(embedding, centroids.T)
+        dists = torch.cdist(embedding, self.centroids, p=2).pow(2) #squared euclid dist
+        logits = -dists
 
         loss = None
         if labels is not None:
@@ -430,7 +427,7 @@ class MMSForCentroid(nn.Module):
     def save_pretrained(self, save_directory):
         if not os.path.exists(save_directory):
             os.makedirs(save_directory)
-        self.mms.save_pretrained(save_directory)
+        self.encoder.save_pretrained(save_directory)
         torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
 
 # %%
@@ -512,10 +509,10 @@ class AudioDataCollator:
 data_collator = AudioDataCollator(feature_extractor)
 
 # %%
-batch_size = 32
-gradient_accumulation_steps = 4
+batch_size = 16
+gradient_accumulation_steps = 2
 num_train_epochs = 15
-lr = 3e-5
+lr = 1e-5
 
 # %%
 wandb.init(project="Indic-SLID", name=f"SLID_{model_id}_{lr}_{current_time_str}")
@@ -614,16 +611,20 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
         for batch in dataloader:
             inputs = {k: v.to(model_device) for k, v in batch.items() if k != "labels"}
             output = model.encoder(**inputs)
-            hidden_state = output.last_hidden_state
-            attention_mask = inputs.get("attention_mask")
+            hidden = output.last_hidden_state
+            if "attention_mask" in inputs:
+                mask = inputs["attention_mask"]
+                seq_len = hidden.shape[1]
+                step = max(1, mask.shape[1] // seq_len)
+                mask = mask[:, ::step][:, :seq_len].unsqueeze(-1)
 
-            if attention_mask is not None:
-                # same as in forward
-                mask = attention_mask.unsqueeze(-1)
-                hidden_state = hidden_state * mask
-                embedding = hidden_state.sum(dim=1) / mask.sum(dim=1)
+                hidden = hidden * mask
+                pooled = hidden.sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
             else:
-                embedding = hidden_state.mean(dim=1)
+                pooled = hidden.mean(dim=1)
+
+            embedding = model.embedding(pooled)
+            embedding = F.normalize(embedding, dim=-1)
 
             embeddings.append(embedding.cpu())
             labels.append(batch["labels"])
@@ -642,7 +643,7 @@ def plot_embeddings(model, dataset, str_to_int, num_samples=500):
         plt.scatter(reduced[mask, 0], reduced[mask, 1], label=lang, alpha=0.6)
 
     plt.legend()
-    plt.title("t-SNE Visualization of Language Embeddings (Centroid-based)")
+    plt.title("t-SNE Visualization of Language Embeddings")
     plt.savefig("tsne_embeddings.png")
     wandb.log({"plots/tsne": wandb.Image("tsne_embeddings.png")})
     plt.show()
@@ -663,7 +664,7 @@ def plot_confusion_matrix(trainer, dataset, labels):
     # xticks_rotation='vertical' -> prevents long language names from overlapping
     # values_format='d' -> integers in cells
     disp.plot(cmap="Blues", ax=ax, xticks_rotation='vertical', values_format='d')
-    plt.title("Confusion Matrix: Task 2")
+    plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.savefig("confusion_matrix.png")
     wandb.log({"plots/confusion_matrix": wandb.Image("confusion_matrix.png")})
