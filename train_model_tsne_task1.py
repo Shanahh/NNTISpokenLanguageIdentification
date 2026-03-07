@@ -39,6 +39,8 @@ from transformers import (
 
 from huggingface_hub import login
 
+from sklearn.manifold import TSNE
+
 # import Hugging Face libraries
 import evaluate
 
