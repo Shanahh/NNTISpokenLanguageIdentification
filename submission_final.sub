@@ -1,0 +1,28 @@
+universe                = docker
+docker_image            = axxiomma/nntispokenlanguageidentification:latest
+docker_pull_policy      = always
+
+executable              = /usr/bin/python3
+arguments               = /app/train_model.py
+
+# CHANGE TO YOUR HF AND WAND KEYS
+environment             = "HOME=/tmp HF_HOME=/tmp/.cache WANDB_API_KEY=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 WANDB_PROJECT=Indic-SLID HF_KEY=hf_ufHQIslqzqWMJ>
+
+output                  = train.out
+error                   = train.err
+log                     = train.log
+
+request_cpus            = 6
+request_memory          = 20G
+request_disk            = 15GB
+request_gpus            = 1
+
+
+requirements            = ((UidDomain == "cs.uni-saarland.de") && (GPUs_GlobalMemoryMb >= 12000))
++WantGPUHomeMounted     = true
+
+
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+
+queue
