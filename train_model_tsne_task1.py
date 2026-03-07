@@ -41,6 +41,8 @@ from huggingface_hub import login
 
 from sklearn.manifold import TSNE
 
+from matplotlib.pyplot import plt
+
 # import Hugging Face libraries
 import evaluate
 
